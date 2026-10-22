@@ -38,6 +38,20 @@ pipeline {
             }
         }
 
+        stage('Snyk Dependency Scan') {
+            steps {
+                snykSecurity(
+                    snykInstallation: 'Snyk',
+                    snykTokenId: 'snyk-token',
+                    targetFile: 'requirements.txt',
+                    additionalArguments: '--command=venv/bin/python',
+                    failOnIssues: false,
+                    failOnError: true,
+                    monitorProjectOnBuild: false
+                )
+            }
+        }
+
         stage('Build Docker Image') {
             steps {
                 sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
