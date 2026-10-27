@@ -64,6 +64,12 @@ pipeline {
             }
         }
 
+        stage('Verify Non-Root Container') {
+            steps {
+                sh 'docker run --rm ${IMAGE_NAME}:${BUILD_NUMBER} id -u | grep -vq "^0$"'
+            }
+        }
+
         stage('Trivy Image Scan') {
             steps {
                 sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 ${IMAGE_NAME}:${BUILD_NUMBER}'
