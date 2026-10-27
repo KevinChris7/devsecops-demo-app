@@ -14,6 +14,12 @@ pipeline {
             }
         }
 
+        stage('Gitleaks Secret Scan') {
+            steps {
+                sh 'gitleaks git -v --exit-code 0 .'
+            }
+        }
+
         stage('Install Dependencies') {
             steps {
                 sh 'python3 -m venv venv'
