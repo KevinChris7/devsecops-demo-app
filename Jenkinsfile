@@ -58,6 +58,12 @@ pipeline {
             }
         }
 
+        stage('Trivy Image Scan') {
+            steps {
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 ${IMAGE_NAME}:${BUILD_NUMBER}'
+            }
+        }
+
         stage('Deploy Container') {
             steps {
                 sh 'docker rm -f ${CONTAINER_NAME} || true'
