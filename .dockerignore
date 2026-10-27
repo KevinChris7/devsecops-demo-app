@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv
+__pycache__
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+Jenkinsfile
+sonar-project.properties
+test_app.py
+gitleaks-report.json
+trivy-report.json
