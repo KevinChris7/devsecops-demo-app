@@ -1,8 +1,10 @@
+import os
+import secrets
 from flask import Flask
 from flask_wtf.csrf import CSRFProtect
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'dev-only-change-me'  # CSRFProtect needs this set
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
 csrf = CSRFProtect()
 csrf.init_app(app)
 
