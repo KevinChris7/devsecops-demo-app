@@ -14,9 +14,9 @@ pipeline {
             }
         }
 
-        stage('Gitleaks Secret Scan') {
+        stage('Gitleaks Secret Gate') {
             steps {
-                sh 'gitleaks git -v --exit-code 0 .'
+                sh 'gitleaks git -v --redact --exit-code 1 .'
             }
         }
 
@@ -44,14 +44,23 @@ pipeline {
             }
         }
 
-        stage('Snyk Dependency Scan') {
+        stage('SonarQube Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Snyk Dependency Gate') {
             steps {
                 snykSecurity(
                     snykInstallation: 'Snyk',
                     snykTokenId: 'snyk-token',
                     targetFile: 'requirements.txt',
                     additionalArguments: '--command=venv/bin/python',
-                    failOnIssues: false,
+                    severity: 'high',
+                    failOnIssues: true,
                     failOnError: true,
                     monitorProjectOnBuild: false
                 )
@@ -60,7 +69,7 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
+                sh 'docker build --pull -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
             }
         }
 
@@ -70,9 +79,9 @@ pipeline {
             }
         }
 
-        stage('Trivy Image Scan') {
+        stage('Trivy Image Gate') {
             steps {
-                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 ${IMAGE_NAME}:${BUILD_NUMBER}'
+                sh 'trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE_NAME}:${BUILD_NUMBER}'
             }
         }
 
