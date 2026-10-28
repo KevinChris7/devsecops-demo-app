@@ -8,7 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
-COPY --chown=appuser:appgroup app.py .
+COPY app.py .
+RUN chmod 444 app.py
 
 USER appuser
 
