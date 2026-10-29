@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = 'devsecops-demo-app'
+        IMAGE_NAME = 'kevinchris7/devsecops-demo-app'
         CONTAINER_NAME = 'devsecops-demo-app'
     }
 
@@ -85,6 +85,29 @@ pipeline {
             }
         }
 
+        stage('Push Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKERHUB_USER',
+                        passwordVariable: 'DOCKERHUB_TOKEN'
+                    )
+                ]) {
+                    sh 'echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin'
+                    sh 'docker push ${IMAGE_NAME}:${BUILD_NUMBER}'
+                    sh 'docker logout'
+                }
+            }
+        }
+
+        stage('Pull Published Image') {
+            steps {
+                sh 'docker image rm ${IMAGE_NAME}:${BUILD_NUMBER}'
+                sh 'docker pull ${IMAGE_NAME}:${BUILD_NUMBER}'
+            }
+        }
+
         stage('Deploy Container') {
             steps {
                 sh 'docker rm -f ${CONTAINER_NAME} || true'
@@ -97,6 +120,12 @@ pipeline {
                 sh 'sleep 5'
                 sh 'curl -f http://localhost:5000/health'
             }
+        }
+    }
+
+    post {
+        always {
+            deleteDir()
         }
     }
 }
