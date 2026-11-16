@@ -4,7 +4,7 @@
 # email addresses on their commits, and matches them against a list of email addresses to remove.
 # Read-only: it changes nothing on GitHub.
 #
-# Usage (Git Bash on the clean EC2 instance, signed in as the owner account):
+# Usage (Terminal on the clean EC2 instance, signed in as the owner account):
 #   bash collaborator-report.sh <owner-account-name> <repo-inventory-folder> [emails-to-remove.txt]
 #
 # emails-to-remove.txt: email addresses in any layout (one per line, comma-separated,
@@ -26,8 +26,11 @@ if [ -n "$EMAILS" ] && [ ! -f "$EMAILS" ]; then echo "Email list '$EMAILS' not f
 lower() { tr '[:upper:]' '[:lower:]'; }
 OWNER_L=$(printf '%s' "$OWNER" | lower)
 
-if ! gh auth status >/dev/null 2>&1 </dev/null; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | lower)" != "$OWNER_L" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
@@ -37,7 +40,8 @@ OUT="$INV/collaborator-review-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" || exit 1
 ERR="$OUT/errors.txt"; : > "$ERR"
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap '( cd "$OUT" && find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt ); rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -54,8 +58,8 @@ ratecheck() {
   sleep "$pause"
 }
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -240,7 +244,7 @@ SUGG="$OUT/remove-logins-suggested.txt"
   for login in "${LOGINS[@]}"; do [ -n "${MATCH[$login]:-}" ] && echo "$login"; done | sort -f
 } > "$SUGG"
 
-( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
 
 matched=$(grep -vc '^#' "$SUGG")
 c_notfound=$(awk -F'\t' 'NR>1 && $2=="" && $3 ~ /^not found/' "$OUT/email_lookup.tsv" | wc -l | tr -d ' ')
