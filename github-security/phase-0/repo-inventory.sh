@@ -3,7 +3,7 @@
 # Lists deploy keys, webhooks, collaborators, pending invitations and rulesets on every repo.
 # Read-only: it changes nothing on GitHub.
 #
-# Usage (Git Bash on the clean EC2 instance):
+# Usage (Terminal on the clean EC2 instance):
 #   gh auth login                                  # once, signed in as the OWNER account
 #   bash repo-inventory.sh <owner-account-name>
 
@@ -16,11 +16,14 @@ if [ -z "$OWNER" ]; then
 fi
 
 # Must be signed in, and signed in as the owner account (not Kavitha's own account)
-if ! gh auth status >/dev/null 2>&1 </dev/null; then
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then
   echo "Not signed in to GitHub CLI. Run: gh auth login"
   exit 1
 fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
@@ -29,7 +32,8 @@ fi
 OUT="repo-inventory-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" && cd "$OUT" || exit 1
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap 'find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt; rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -49,8 +53,8 @@ ratecheck() {
 # ghq <outfile> <gh api args...>: one API call, output to <outfile>.
 # Retries after rate limits and server/network errors; not after "not found"-type answers.
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -142,7 +146,7 @@ echo
 echo "--- Pending invitations ---"
 awk -F'\t' 'NR>1' invitations.tsv
 
-find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt
+find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt
 
 echo
 if [ "$nfail" -gt 0 ]; then
