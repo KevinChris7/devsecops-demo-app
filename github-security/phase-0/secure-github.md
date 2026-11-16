@@ -28,7 +28,7 @@
 
 **Rules for this phase**
 - **Screenshot first, delete second.** Every list you clean up is evidence.
-- **Keep evidence off the laptops.** Save screenshots and exports in one folder on the EC2 instance, record a SHA-256 hash of each file (`Get-FileHash <file>` in PowerShell), and copy the folder daily to a restricted company location (for example a SharePoint folder or an S3 bucket with versioning) that only Kavitha, the backup person and Kevin can open.
+- **Keep evidence off the laptops.** Save screenshots and exports in one folder on the EC2 instance, record a SHA-256 hash of each file (in the Terminal: `sha256sum <file> >> evidence-hashes.txt`), and copy the folder daily to a restricted company location (for example a SharePoint folder or an S3 bucket with versioning) that only Kavitha, the backup person and Kevin can open.
 - **If something can't be explained, stop and call Kevin.** For example: a login from an unknown place, 2FA turned off, a key or collaborator nobody added.
 - **Use the incident Teams group** for updates, not email or other chats. Keep the group to the people working on this, and make sure each member has MFA on their Microsoft account.
 - Record every action in the evidence log at the end.
@@ -39,26 +39,144 @@
 
 All owner-account work happens inside this instance, never on a developer laptop.
 
-**Team sets up the instance**
-- [ ] Launch from an official, current AWS AMI (Windows Server 2022/2025 if Kavitha prefers Windows), fully patched.
-- [ ] **Check the AWS account first.** If AWS keys for this account were on any developer machine, rotate them before launching (see 1b.7). An attacker with those keys could reach the instance.
-- [ ] No inbound ports open to the internet. Use **AWS Systems Manager Fleet Manager / Session Manager**, or allow RDP only from Kavitha's current public IP (/32).
-- [ ] IMDSv2 required, encrypted disk, no IAM role except what Session Manager needs.
-- [ ] Local admin password unique, stored in the company password vault.
-- [ ] Only these installed, from official sites: a browser (Edge or Chrome), Git for Windows, GitHub CLI (`gh`). **No VS Code, Node.js, npm or TortoiseGit.**
-- [ ] Browser: **don't sign in to browser sync** (Edge or Chrome profile), turn off password saving, and clear browsing data at the end of each session. Synced or saved logins would leave the instance.
-- [ ] Windows Defender on and updated; screen locks after 5 minutes idle; RDP uses Network Level Authentication.
-- [ ] In the RDP client, **turn off drive and clipboard redirection**, so files can't pass between Kavitha's laptop and the instance. Because copy-paste from the laptop is off, open this runbook **inside the EC2 browser** (from the incident Teams group or SharePoint) to copy commands.
-- [ ] Record who in the team has AWS permission to access or snapshot this instance (section 1c).
-- [ ] At the end of every session: run `gh auth logout`, sign out of GitHub and the mailbox in the browser, then stop the instance. Terminate it when the engagement ends.
+The team's AWS admin sets this up once, in the order below. Every step ends with a check. Commands are typed in the Session Manager shell (step 2) unless a step says otherwise.
+
+**Before launching:** if AWS keys for this AWS account were on any developer machine, rotate them first (see 1b.7). Anyone holding those keys could reach the instance.
+
+**Step 1 — Create the IAM role (AWS console → IAM → Roles → Create role)**
+1. Trusted entity: **AWS service → EC2**. Name it, for example, `github-admin-ec2`.
+2. Attach the managed policy **`AmazonSSMManagedInstanceCore`** (lets Session Manager reach the instance).
+3. Add an inline policy for DCV's licence check. Replace `<region>` with the instance's Region, for example `ap-south-1`:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       { "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::dcv-license.<region>/*" }
+     ]
+   }
+   ```
+   Attach nothing else. DCV needs no licence on EC2, only this check.
+
+**Step 2 — Launch the instance (EC2 → Launch instance)**
+- **AMI:** Ubuntu Server **26.04 LTS** published by **Canonical** (owner ID `099720109477`), 64-bit (x86).
+- **Instance type:** 2 vCPUs and 8 GB memory, for example `t3.large`.
+- **Key pair:** *Proceed without a key pair*. Session Manager replaces SSH.
+- **Network:** a subnet with outbound internet access (needed for updates, GitHub, Session Manager and DCV's licence check).
+- **Security group, inbound rules:** choose one access path and record which:
+  - **Option A (simpler):** one rule, *Custom TCP 8443*, source **Kavitha's current public IP /32**. Nothing else; no port 22.
+  - **Option B (no open ports):** no inbound rules at all. Kavitha reaches DCV through a Session Manager port-forwarding tunnel (see *Kavitha connects* below).
+- **Storage:** 30 GB, **Encrypted: Yes**.
+- **Advanced details:** IAM instance profile = the role from step 1; **Metadata version: V2 only (token required)**.
+- For option A, attach an **Elastic IP** so the address doesn't change each time the instance is started.
+
+*Check:* EC2 → the instance → **Connect → Session Manager → Connect** opens a shell within a few minutes. Session Manager's agent comes preinstalled on Canonical's Ubuntu images. If it won't connect, check the IAM role is attached and outbound internet access works.
+
+**Step 3 — Patch**
+```bash
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+```
+Automatic security updates are on by default; leave them on. Reconnect with Session Manager after about a minute.
+
+**Step 4 — Desktop (AWS's steps for DCV on Ubuntu 26.04)**
+```bash
+sudo apt update && sudo apt install -y ubuntu-desktop mesa-utils
+sudo systemctl set-default graphical.target
+sudo reboot
+```
+*Check (after reconnecting):* `systemctl is-active graphical.target` prints `active`.
+
+**Step 5 — Install the DCV server**
+```bash
+cd /tmp
+wget https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY && gpg --import NICE-GPG-KEY
+wget https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-ubuntu2604-x86_64.tgz
+tar -xvzf nice-dcv-ubuntu2604-x86_64.tgz && cd nice-dcv-*-ubuntu2604-x86_64
+sudo apt install -y ./nice-dcv-server_*_amd64.ubuntu2604.deb
+sudo usermod -aG video dcv
+sudo systemctl enable --now dcvserver
+```
+*Check:* `systemctl is-active dcvserver` prints `active`.
+
+**Step 6 — Kavitha's desktop user (no admin rights)**
+```bash
+sudo adduser kavitha
+```
+Give it a unique password and store it in the company password vault. Don't add it to the `sudo` group. Admin work stays in Session Manager.
+*Check:* `groups kavitha` doesn't list `sudo`.
+
+**Step 7 — Lock down DCV and start Kavitha's session**
+1. Create a permissions file that blocks copy-paste and file transfer in both directions:
+   ```bash
+   sudo tee /etc/dcv/locked.perm > /dev/null <<'PERM'
+   [permissions]
+   %owner% allow builtin
+   %any% deny clipboard-copy clipboard-paste file-upload file-download
+   PERM
+   ```
+   A `deny` can't be overridden, so these four stay off even for the session owner.
+2. Start the session. On Ubuntu 26.04, DCV runs *virtual* sessions only, and a virtual session ends when the instance stops. So the admin runs this **every time the instance is started**:
+   ```bash
+   sudo dcv create-session --type=virtual --owner kavitha --permissions-file /etc/dcv/locked.perm kavitha
+   sudo dcv list-sessions
+   ```
+   *Check:* the list shows a session `kavitha` owned by `kavitha`.
+3. Note the server certificate's fingerprint. Kavitha compares it the first time she connects:
+   ```bash
+   sudo openssl x509 -in /etc/dcv/dcv.pem -noout -fingerprint -sha256
+   ```
+
+**Step 8 — Tools (only these, from Ubuntu and GitHub's official sources)**
+No VS Code, Node.js, npm or TortoiseGit.
+```bash
+sudo apt update && sudo apt install -y git curl bsdextrautils libreoffice-calc
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+sudo apt update && sudo apt install -y gh
+git --version && gh --version
+```
+*Check:* the last line prints both versions. The browser is **Firefox**, which comes with the Ubuntu desktop; LibreOffice Calc opens the `.tsv` review sheets.
+
+**Step 9 — Record:** the access option chosen (A or B), the Elastic IP (option A), the certificate fingerprint, and who in the team has AWS permission to access or snapshot this instance (section 1c).
+
+**Kavitha connects**
+1. On her laptop, install the **Amazon DCV client for Windows** from AWS's official DCV download page.
+2. **Option A:** in the DCV client, connect to `<Elastic-IP>:8443`.
+   **Option B:** on her laptop, with the AWS CLI and the Session Manager plugin installed and a short-lived sign-in (`aws sso login`, never saved access keys), open the tunnel:
+   ```
+   aws ssm start-session --target <instance-id> --document-name AWS-StartPortForwardingSession --parameters "portNumber=8443,localPortNumber=8443"
+   ```
+   Leave that window open and connect the DCV client to `localhost:8443`.
+3. The first time, the client warns about the certificate. Accept it **only** if its SHA-256 fingerprint matches the one recorded in step 7.
+4. Sign in as `kavitha` with her desktop password. The Ubuntu desktop opens.
+5. Once, in her session:
+   - Screen lock after 5 minutes idle: Settings → Privacy & Security → Screen Lock.
+   - Firefox: **don't sign in to a Firefox account** (sync), and turn off **Ask to save passwords** (Settings → Privacy & Security).
+   - Open this runbook **inside Firefox on the instance** (from the incident Teams group or SharePoint), because copy-paste from the laptop is blocked.
+
+**At the end of every session:** in the Terminal run `gh auth logout`, sign out of GitHub and the mailbox, clear Firefox's history, cookies and site data, and close the DCV client. Then the admin stops the instance. Terminate it when the engagement ends.
+
+**Kevin's checks before sitting 1**
+
+| Check | Expected |
+| --- | --- |
+| Copy text on the laptop, paste in the instance (and the reverse) | Nothing pastes |
+| DCV client file-transfer option | Missing or refused |
+| `sudo -v` in Kavitha's Terminal | Refused (not an admin) |
+| `gh --version` and Firefox opening github.com | Both work |
+| Security group | Only 8443 from Kavitha's IP (A), or no inbound rules (B); never 22 |
+| EC2 → Instance metadata options | IMDSv2 required |
+
+**If DCV on Ubuntu 26.04 gives trouble** (no desktop after signing in, or the session won't start), use the Ubuntu **24.04 LTS** AMI instead. It's supported until 2029, and DCV has supported it for longer. The scripts were tested on it as well. Tell Kevin before switching, because steps 4 and 7 differ slightly on 24.04.
 
 **Kavitha's side**
 - The EC2 instance is only as safe as the computer used to connect to it. Malware on that computer can capture what she types.
 - Connect from a machine that has **not** run the company's repos with npm or VS Code. If her laptop is in doubt, it gets reimaged first, or she uses another clean machine.
 - 2FA in this phase uses an **authenticator app on company-controlled phones**.
-- **Recommended upgrade:** two FIDO2 security keys (one for Kavitha, one sealed with the backup person). Unlike authenticator codes, they can't be phished or copied. Before relying on them, test once whether the RDP client passes a USB key through to the EC2 browser.
+- **Recommended upgrade:** two FIDO2 security keys (one for Kavitha, one sealed with the backup person). Unlike authenticator codes, they can't be phished or copied. Before relying on them, test once whether the DCV client passes the key through to Firefox on the instance (DCV calls this WebAuthn redirection). If it doesn't, stay with the authenticator app.
 
-**Done when:** instance running with only the listed software, access path agreed, AWS access holders recorded.
+**Done when:** all of Kevin's checks pass, and the access option, fingerprint and AWS access holders are recorded.
 
 ---
 
@@ -231,10 +349,10 @@ The script `repo-inventory.sh` lists all of these for every repo. It only reads;
 
 **What it checks before running:** that the GitHub CLI is signed in, and that it's signed in as the **owner account**, not Kavitha's own account. If either is wrong, it stops with a message.
 
-**How to run it (Git Bash on the EC2 instance):**
+**How to run it (Terminal on the EC2 instance):**
 
 1. Inside the EC2 browser, download the three scripts from the incident Teams group into one folder: `repo-inventory.sh`, `collaborator-report.sh` and `remove-collaborators.sh`. Clipboard and drive sharing are off, so don't copy them from the laptop.
-2. Open **Git Bash** and go to the download folder, for example `cd ~/Downloads`.
+2. Open the **Terminal** and go to the download folder: `cd ~/Downloads`.
 3. Sign in to the GitHub CLI as the owner account (the browser opens for approval):
    ```bash
    gh auth login
@@ -244,7 +362,7 @@ The script `repo-inventory.sh` lists all of these for every repo. It only reads;
    ```bash
    bash repo-inventory.sh <owner-account-name>
    ```
-   It shows progress (`[12/300] repo-name`), then a summary of write-access deploy keys, webhook destinations, collaborators and pending invitations. For 300 repos expect roughly 15–30 minutes. It retries brief GitHub errors and pauses by itself if GitHub's hourly limit is close. If the RDP connection drops, **disconnect rather than sign out** of Windows, so the script keeps running.
+   It shows progress (`[12/300] repo-name`), then a summary of write-access deploy keys, webhook destinations, collaborators and pending invitations. For 300 repos expect roughly 15–30 minutes. It retries brief GitHub errors and pauses by itself if GitHub's hourly limit is close. If the DCV connection drops, just reconnect: the desktop session and the script keep running. Don't sign out of the desktop while it runs.
 5. When finished, run `gh auth logout`.
 
 **What it produces** (in a new folder named `repo-inventory-<date>-<time>`):
@@ -261,7 +379,7 @@ The script `repo-inventory.sh` lists all of these for every repo. It only reads;
 | `errors.txt` | Any lookup that still failed after retries. If it's empty, everything was read. If not, run the script again |
 | `SHA256SUMS.txt` | Hashes of all the files above, for the evidence record |
 
-Copy the whole folder to the evidence location. The `.tsv` files open in Excel.
+Copy the whole folder to the evidence location. The `.tsv` files open in LibreOffice Calc (or Excel).
 
 <details>
 <summary>Full script (for review)</summary>
@@ -272,7 +390,7 @@ Copy the whole folder to the evidence location. The `.tsv` files open in Excel.
 # Lists deploy keys, webhooks, collaborators, pending invitations and rulesets on every repo.
 # Read-only: it changes nothing on GitHub.
 #
-# Usage (Git Bash on the clean EC2 instance):
+# Usage (Terminal on the clean EC2 instance):
 #   gh auth login                                  # once, signed in as the OWNER account
 #   bash repo-inventory.sh <owner-account-name>
 
@@ -285,11 +403,14 @@ if [ -z "$OWNER" ]; then
 fi
 
 # Must be signed in, and signed in as the owner account (not Kavitha's own account)
-if ! gh auth status >/dev/null 2>&1 </dev/null; then
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then
   echo "Not signed in to GitHub CLI. Run: gh auth login"
   exit 1
 fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
@@ -298,7 +419,8 @@ fi
 OUT="repo-inventory-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" && cd "$OUT" || exit 1
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap 'find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt; rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -318,8 +440,8 @@ ratecheck() {
 # ghq <outfile> <gh api args...>: one API call, output to <outfile>.
 # Retries after rate limits and server/network errors; not after "not found"-type answers.
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -411,7 +533,7 @@ echo
 echo "--- Pending invitations ---"
 awk -F'\t' 'NR>1' invitations.tsv
 
-find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt
+find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt
 
 echo
 if [ "$nfail" -gt 0 ]; then
@@ -466,7 +588,7 @@ Anything a later secret scan of the repos finds gets added to this list.
 **How removal works:** `remove-collaborators.sh` **blocks** each approved user from the owner account. Blocking removes the user as a collaborator on every repo the account owns, cancels their pending invitations, and stops them forking or being added again ([GitHub Docs](https://docs.github.com/en/communities/maintaining-your-safety-on-github/blocking-a-user-from-your-personal-account)). That's one action per person instead of up to 300. It can be undone in **Settings → Blocked users → Unblock**; the person then has to be invited again. The script then checks that each person is really gone and removes them repo by repo anywhere they aren't.
 
 **Step 1 — Save the email list (inside the EC2 instance).**
-Create `emails-to-remove.txt` in the same folder as the scripts with all the addresses Kavitha has shared (currently about 51). Any layout works: one per line, comma-separated, `Name <email>`, or pasted from Excel; saved by Notepad in any encoding. Capital letters, duplicates and Gmail variants (`a.b@gmail.com` vs `ab@gmail.com` vs `ab+work@gmail.com`, which Gmail treats as one inbox) are handled. Lines with no email address are listed in `email-list-lines-ignored.txt` so nothing is dropped silently.
+Create `emails-to-remove.txt` in the same folder as the scripts with all the addresses Kavitha has shared (currently about 51). Any layout works: one per line, comma-separated, `Name <email>`, or pasted from Excel; saved by any text editor, in any encoding. Capital letters, duplicates and Gmail variants (`a.b@gmail.com` vs `ab@gmail.com` vs `ab+work@gmail.com`, which Gmail treats as one inbox) are handled. Lines with no email address are listed in `email-list-lines-ignored.txt` so nothing is dropped silently.
 
 **Step 2 — Build the review sheet** (read-only; uses the folder from 1b.6):
 ```bash
@@ -476,7 +598,7 @@ For each person it runs one commit search across all repos, and checks their rep
 
 | File | What it tells Kavitha |
 | --- | --- |
-| `collaborators_review.tsv` | Every collaborator **and pending invitee**: username, name, **account creation date**, emails seen, repos with access, pending invitations, permission, whether they matched the list. Matched people are at the top. Opens in Excel with names shown correctly |
+| `collaborators_review.tsv` | Every collaborator **and pending invitee**: username, name, **account creation date**, emails seen, repos with access, pending invitations, permission, whether they matched the list. Matched people are at the top. Opens in LibreOffice Calc or Excel with names shown correctly |
 | `email_lookup.tsv` | Each email on the list and what was found: the username and how (public profile email, email on their commits, commit history search); an account with **no access** (nothing to remove); **commits found but not linked to any account** (the name on those commits is shown, so Kavitha can identify the person); **OWNER ACCOUNT** (the list contains the owner's own email: check the list); or **not found** |
 | `remove-logins-suggested.txt` | The usernames matched to the list, ready for Kavitha to check |
 
@@ -516,7 +638,7 @@ Type `BLOCK <number>` when asked; anything else cancels. Each block is logged, t
 # email addresses on their commits, and matches them against a list of email addresses to remove.
 # Read-only: it changes nothing on GitHub.
 #
-# Usage (Git Bash on the clean EC2 instance, signed in as the owner account):
+# Usage (Terminal on the clean EC2 instance, signed in as the owner account):
 #   bash collaborator-report.sh <owner-account-name> <repo-inventory-folder> [emails-to-remove.txt]
 #
 # emails-to-remove.txt: email addresses in any layout (one per line, comma-separated,
@@ -538,8 +660,11 @@ if [ -n "$EMAILS" ] && [ ! -f "$EMAILS" ]; then echo "Email list '$EMAILS' not f
 lower() { tr '[:upper:]' '[:lower:]'; }
 OWNER_L=$(printf '%s' "$OWNER" | lower)
 
-if ! gh auth status >/dev/null 2>&1 </dev/null; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | lower)" != "$OWNER_L" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
@@ -549,7 +674,8 @@ OUT="$INV/collaborator-review-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" || exit 1
 ERR="$OUT/errors.txt"; : > "$ERR"
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap '( cd "$OUT" && find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt ); rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -566,8 +692,8 @@ ratecheck() {
   sleep "$pause"
 }
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -752,7 +878,7 @@ SUGG="$OUT/remove-logins-suggested.txt"
   for login in "${LOGINS[@]}"; do [ -n "${MATCH[$login]:-}" ] && echo "$login"; done | sort -f
 } > "$SUGG"
 
-( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
 
 matched=$(grep -vc '^#' "$SUGG")
 c_notfound=$(awk -F'\t' 'NR>1 && $2=="" && $3 ~ /^not found/' "$OUT/email_lookup.tsv" | wc -l | tr -d ' ')
@@ -793,7 +919,7 @@ echo "Suggested removal list:         $SUGG"
 #
 # DRY RUN by default: nothing changes on GitHub unless --apply is given.
 #
-# Usage (Git Bash on the clean EC2 instance, signed in as the owner account):
+# Usage (Terminal on the clean EC2 instance, signed in as the owner account):
 #   bash remove-collaborators.sh <owner> <repo-inventory-folder> <remove-logins.txt>           # dry run
 #   bash remove-collaborators.sh <owner> <repo-inventory-folder> <remove-logins.txt> --apply   # block
 #
@@ -815,13 +941,16 @@ case "$MODE" in "") ;; --apply) APPLY=1 ;; *) usage ;; esac
 lower() { tr '[:upper:]' '[:lower:]'; }
 OWNER_L=$(printf '%s' "$OWNER" | lower)
 
-if ! gh auth status >/dev/null 2>&1 </dev/null; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | lower)" != "$OWNER_L" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
 fi
-if ! gh api user/blocks --silent >/dev/null 2>&1 </dev/null; then
+if ! retry3 gh api user/blocks --silent; then
   echo "The GitHub CLI doesn't have permission to manage blocked users yet."
   echo "Run:  gh auth refresh -s user    then run this script again."
   exit 1
@@ -831,7 +960,8 @@ OUT="$INV/removal-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" || exit 1
 ERR="$OUT/errors.txt"; : > "$ERR"
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap '( cd "$OUT" && find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt ); rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -848,8 +978,8 @@ ratecheck() {
   sleep "$pause"
 }
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -882,7 +1012,7 @@ for u in "${USERS[@]}"; do
     echo "  Refusing: '$u' is the owner account itself."; bad=1; continue
   fi
   if ghq "$TMPD/u" "users/$u" -q "[.login, (.name // \"\"), .type] | join(\"$US\")"; then
-    IFS="$US" read -r ulogin uname utype < "$TMPD/u"
+    IFS="$US" read -r _ uname utype < "$TMPD/u"
     if [ "$utype" != "User" ]; then echo "  Refusing: '$u' is an organization, not a person."; bad=1; continue; fi
     NAME_OF["$u"]=$uname
   else
@@ -936,7 +1066,7 @@ echo "Forks held by these users: $nforks  (listed in forks_found.tsv)"
 [ "$nferr" -gt 0 ] && echo "WARNING: forks couldn't be checked for $nferr repos (see errors.txt)."
 
 if [ $APPLY -eq 0 ]; then
-  ( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+  ( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
   echo
   echo "DRY RUN: nothing was changed on GitHub."
   echo "Review $OUT/removal_plan.tsv and forks_found.tsv, get Kavitha's go-ahead, then run again with --apply."
@@ -997,7 +1127,7 @@ for u in "${USERS[@]}"; do
   printf '%s\t%s\t%s\t%s\n' "$u" "$blocked" "$(printf '%s\n' "${still[@]:-}" | grep -v '^$' | paste -sd, -)" "$action" >> "$OUT/verification.tsv"
 done
 
-( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
 
 echo
 echo "================ RESULT ================"
