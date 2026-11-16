@@ -6,7 +6,7 @@
 #
 # DRY RUN by default: nothing changes on GitHub unless --apply is given.
 #
-# Usage (Git Bash on the clean EC2 instance, signed in as the owner account):
+# Usage (Terminal on the clean EC2 instance, signed in as the owner account):
 #   bash remove-collaborators.sh <owner> <repo-inventory-folder> <remove-logins.txt>           # dry run
 #   bash remove-collaborators.sh <owner> <repo-inventory-folder> <remove-logins.txt> --apply   # block
 #
@@ -28,13 +28,16 @@ case "$MODE" in "") ;; --apply) APPLY=1 ;; *) usage ;; esac
 lower() { tr '[:upper:]' '[:lower:]'; }
 OWNER_L=$(printf '%s' "$OWNER" | lower)
 
-if ! gh auth status >/dev/null 2>&1 </dev/null; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
-ME=$(gh api user -q .login 2>/dev/null </dev/null) || { echo "Could not read the signed-in account."; exit 1; }
+retry3() { local i; for i in 1 2 3; do "$@" >/dev/null 2>&1 </dev/null && return 0; [ $i -lt 3 ] && sleep 5; done; return 1; }
+if ! retry3 gh auth status; then echo "Not signed in to GitHub CLI. Run: gh auth login"; exit 1; fi
+ME=""
+for _try in 1 2 3; do ME=$(gh api user -q .login 2>/dev/null </dev/null) && [ -n "$ME" ] && break; ME=""; sleep 5; done
+[ -n "$ME" ] || { echo "Could not read the signed-in account: GitHub did not answer after 3 tries. Check the connection and run again."; exit 1; }
 if [ "$(printf '%s' "$ME" | lower)" != "$OWNER_L" ]; then
   echo "Signed in as '$ME', not '$OWNER'. Run 'gh auth login' as the owner account, then try again."
   exit 1
 fi
-if ! gh api user/blocks --silent >/dev/null 2>&1 </dev/null; then
+if ! retry3 gh api user/blocks --silent; then
   echo "The GitHub CLI doesn't have permission to manage blocked users yet."
   echo "Run:  gh auth refresh -s user    then run this script again."
   exit 1
@@ -44,7 +47,8 @@ OUT="$INV/removal-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" || exit 1
 ERR="$OUT/errors.txt"; : > "$ERR"
 TMPD=$(mktemp -d) || exit 1
-trap 'rm -rf "$TMPD"' EXIT
+# On any exit: record checksums of whatever was produced, then clean up
+trap '( cd "$OUT" && find . -maxdepth 1 -type f ! -name "SHA256SUMS*" | sort | xargs -r sha256sum > SHA256SUMS.tmp 2>/dev/null && mv SHA256SUMS.tmp SHA256SUMS.txt ); rm -rf "$TMPD"' EXIT
 
 # ---- GitHub API helpers ------------------------------------------------------
 CALLS=0
@@ -61,8 +65,8 @@ ratecheck() {
   sleep "$pause"
 }
 ghq() {
-  local of=$1 rc=1 attempt; shift
-  for attempt in 1 2 3; do
+  local of=$1 rc=1; shift
+  for _ in 1 2 3; do
     ratecheck
     gh api "$@" > "$of" 2> "$TMPD/err" </dev/null; rc=$?
     GHQ_ERR=$(tr '\n\t' '  ' < "$TMPD/err")
@@ -95,7 +99,7 @@ for u in "${USERS[@]}"; do
     echo "  Refusing: '$u' is the owner account itself."; bad=1; continue
   fi
   if ghq "$TMPD/u" "users/$u" -q "[.login, (.name // \"\"), .type] | join(\"$US\")"; then
-    IFS="$US" read -r ulogin uname utype < "$TMPD/u"
+    IFS="$US" read -r _ uname utype < "$TMPD/u"
     if [ "$utype" != "User" ]; then echo "  Refusing: '$u' is an organization, not a person."; bad=1; continue; fi
     NAME_OF["$u"]=$uname
   else
@@ -149,7 +153,7 @@ echo "Forks held by these users: $nforks  (listed in forks_found.tsv)"
 [ "$nferr" -gt 0 ] && echo "WARNING: forks couldn't be checked for $nferr repos (see errors.txt)."
 
 if [ $APPLY -eq 0 ]; then
-  ( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+  ( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
   echo
   echo "DRY RUN: nothing was changed on GitHub."
   echo "Review $OUT/removal_plan.tsv and forks_found.tsv, get Kavitha's go-ahead, then run again with --apply."
@@ -210,7 +214,7 @@ for u in "${USERS[@]}"; do
   printf '%s\t%s\t%s\t%s\n' "$u" "$blocked" "$(printf '%s\n' "${still[@]:-}" | grep -v '^$' | paste -sd, -)" "$action" >> "$OUT/verification.tsv"
 done
 
-( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
+( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | sort | xargs -r sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS.txt )
 
 echo
 echo "================ RESULT ================"
