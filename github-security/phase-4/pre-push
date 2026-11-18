@@ -1,0 +1,104 @@
+#!/bin/sh
+# company-safety-pre-push v1
+# Runs before every git push (installed by setup-dev-machine.ps1). It blocks a push that contains:
+#   - signs of the worm: VS Code tasks that run on folder open, code hidden in config files,
+#     the worm's .bat spreader files, fake font files
+#   - secrets such as tokens and passwords (gitleaks)
+#   - high-severity dependency problems, when dependency files changed (Snyk)
+# It is a safety net for developers. The GitHub rulesets on the server remain the real protection.
+
+zero=0000000000000000000000000000000000000000
+cfg_re='^(vite|next|postcss|tailwind|eslint|babel|webpack|nuxt|svelte|astro|vue|jest|vitest|rollup|tsup|remix|metro)\.config\.(js|cjs|mjs|ts|cts|mts)$|^gatsby-config\.(js|mjs|ts)$|^\.eslintrc\.(js|cjs)$'
+deps_re='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|pom\.xml|build\.gradle(\.kts)?|requirements\.txt)$'
+
+say() { printf '%s\n' "$*" >&2; }
+input=$(cat)
+
+printf '%s\n' "$input" | {
+  rc=0; snyk_done=0
+  # shellcheck disable=SC2034  # lref/rref are read but not needed
+  while read -r lref lsha rref rsha; do
+    [ -z "$lsha" ] && continue
+    [ "$lsha" = "$zero" ] && continue                      # deleting a branch: nothing to check
+    if [ "$rsha" != "$zero" ] && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+      revs="$rsha..$lsha"                                  # existing branch: only the new commits
+    else
+      revs="$lsha --not --remotes"                         # new branch: commits not already on the server
+    fi
+
+    # Files added or changed in the commits being pushed, as they stand in the pushed version
+    # shellcheck disable=SC2086  # $revs is deliberately split into git arguments
+    files=$(git log --format= --name-only --diff-filter=ACMR $revs 2>/dev/null </dev/null | sort -u)
+    tmp=$(printf '%s\n' "$files")
+    printf '%s\n' "$tmp" | while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      base=${f##*/}
+      case "$f" in
+        .vscode/tasks.json|*/.vscode/tasks.json)
+          if git show "$lsha:$f" 2>/dev/null | grep -Eq '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"'; then
+            say "BLOCKED: $f runs a task automatically when the folder is opened (how the worm spreads)."; echo x
+          fi ;;
+      esac
+      case "$base" in
+        temp_auto_push.bat|temp_interactive_push.bat) say "BLOCKED: $f is a known worm spreader file."; echo x ;;
+      esac
+      if printf '%s\n' "$base" | grep -Eq "$cfg_re"; then
+        if git show "$lsha:$f" 2>/dev/null | grep -Eq '[[:space:]]{150,}[^[:space:]]'; then
+          say "BLOCKED: $f has code hidden after a long run of spaces (how the worm hides its payload)."; echo x
+        elif git show "$lsha:$f" 2>/dev/null | awk 'length > 1000 { found = 1 } END { exit !found }'; then
+          say "BLOCKED: $f has a line over 1000 characters (likely hidden code)."; echo x
+        fi
+      fi
+      case "$base" in
+        *.woff2)
+          magic=$(git show "$lsha:$f" 2>/dev/null | head -c 4)
+          [ "$magic" = "wOF2" ] || { say "BLOCKED: $f is not a real font file (the worm hides code in fake fonts)."; echo x; } ;;
+      esac
+    done | grep -q x && rc=1
+
+    # Secrets in the commits being pushed
+    if command -v gitleaks >/dev/null 2>&1; then
+      if gitleaks git --help >/dev/null 2>&1 </dev/null; then
+        gitleaks git --log-opts="$revs" --redact --no-banner --exit-code 3 >&2 </dev/null; grc=$?
+      else
+        gitleaks detect --source . --log-opts="$revs" --redact --no-banner --exit-code 3 >&2 </dev/null; grc=$?
+      fi
+      case $grc in
+        0) ;;
+        3) say "BLOCKED: gitleaks found a secret in these commits. Remove it, and treat it as leaked: rotate it."; rc=1 ;;
+        *) say "WARNING: gitleaks could not run (exit $grc). Tell the tech lead." ;;
+      esac
+    else
+      say "WARNING: gitleaks is not installed, so secrets were not checked."
+    fi
+
+    # Dependencies changed: Snyk check (once per push)
+    if [ $snyk_done -eq 0 ] && printf '%s\n' "$files" | grep -Eq "$deps_re"; then
+      snyk_done=1
+      if command -v snyk >/dev/null 2>&1; then
+        org=$(git config --get safety.snykOrg)
+        say "Dependency files changed: running Snyk${org:+ (organization $org)}..."
+        if [ -n "$org" ]; then snyk test --all-projects --severity-threshold=high --org="$org" >&2 </dev/null; src=$?
+        else snyk test --all-projects --severity-threshold=high >&2 </dev/null; src=$?; fi
+        case $src in
+          0) ;;
+          1) say "BLOCKED: Snyk found high-severity problems in the dependencies (details above)."; rc=1 ;;
+          3) ;;  # no supported project files
+          *) say "WARNING: Snyk could not run (exit $src). Check 'snyk auth' and the organization." ;;
+        esac
+      else
+        say "WARNING: Snyk is not installed, so dependencies were not checked."
+      fi
+    fi
+  done
+  exit $rc
+}
+status=$?
+
+if [ $status -ne 0 ]; then
+  say ""
+  say "Push stopped by the company safety check. Nothing was sent."
+  say "If you believe this is a false alarm, talk to the tech lead. Don't bypass it with --no-verify."
+  exit 1
+fi
+exit 0
