@@ -1,5 +1,5 @@
 #!/bin/sh
-# company-safety-pre-push v1
+# company-safety-pre-push v1.2
 # Runs before every git push (installed by setup-dev-machine.ps1). It blocks a push that contains:
 #   - signs of the worm: VS Code tasks that run on folder open, code hidden in config files,
 #     the worm's .bat spreader files, fake font files
@@ -37,10 +37,25 @@ printf '%s\n' "$input" | {
         .vscode/tasks.json|*/.vscode/tasks.json)
           if git show "$lsha:$f" 2>/dev/null | grep -Eq '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"'; then
             say "BLOCKED: $f runs a task automatically when the folder is opened (how the worm spreads)."; echo x
+          elif git show "$lsha:$f" 2>/dev/null | grep -Eq 'node[^"]*\.woff2'; then
+            say "BLOCKED: $f runs a font file as code (how the worm starts its payload)."; echo x
+          fi ;;
+      esac
+      case "$base" in
+        spellright.dict)
+          if git show "$lsha:$f" 2>/dev/null | grep -Eq '[[:space:]]{150,}[^[:space:]]|require\(|eval\(|Function\(|child_process'; then
+            say "BLOCKED: $f is a spell-check dictionary containing code (the worm hides a loader here)."; echo x
           fi ;;
       esac
       case "$base" in
         temp_auto_push.bat|temp_interactive_push.bat) say "BLOCKED: $f is a known worm spreader file."; echo x ;;
+      esac
+      case "$base" in
+        *.js|*.cjs|*.mjs|*.ts|*.cts|*.mts|*.jsx|*.tsx|*.php|*.json|*.dict)
+          # shellcheck disable=SC2016  # the markers are literal text, not variables
+          if git show "$lsha:$f" 2>/dev/null | grep -Fq -e 'rmcej%otb%' -e 'Cot%3t=shtP' -e '_$_1e42' -e 'function MDy(' -e "global['!']" -e "global['_V']"; then
+            say "BLOCKED: $f contains the PolinRider worm's code."; echo x
+          fi ;;
       esac
       if printf '%s\n' "$base" | grep -Eq "$cfg_re"; then
         if git show "$lsha:$f" 2>/dev/null | grep -Eq '[[:space:]]{150,}[^[:space:]]'; then

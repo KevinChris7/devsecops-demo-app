@@ -19,7 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Version = '1.0'
+$Version = '1.2'
 $HomeDir = $env:USERPROFILE
 if (-not $HomeDir) { $HomeDir = $HOME }
 if (-not $ScanRoot) { $ScanRoot = $HomeDir }
@@ -54,6 +54,9 @@ $wormFiles   = @('temp_auto_push.bat', 'temp_interactive_push.bat')
 $maybeFiles  = @('branch_structure.json', 'config.bat')
 $configRegex = '^(vite|next|postcss|tailwind|eslint|babel|webpack|nuxt|svelte|astro|vue|jest|vitest|rollup|tsup|remix|metro)\.config\.(js|cjs|mjs|ts|cts|mts)$|^gatsby-config\.(js|mjs|ts)$|^\.eslintrc\.(js|cjs)$'
 $skipDirs    = @('node_modules', '.git', '$Recycle.Bin', 'System Volume Information')
+# PolinRider payload signatures (OpenSourceMalware): string markers, decoder names, injected globals (matched case-sensitively)
+$sigRegex    = 'rmcej%otb%|Cot%3t=shtP|_\$_1e42|function MDy\(|global\[''!''\]|global\[''_V''\]'
+$codeExt     = @('.js', '.cjs', '.mjs', '.ts', '.cts', '.mts', '.jsx', '.tsx', '.php')
 $repoDirs    = New-Object System.Collections.Generic.List[object]
 $scanned = 0; $unreadable = 0
 
@@ -90,12 +93,14 @@ while ($stack.Count -gt 0) {
       if ($lname -eq 'tasks.json' -and ([System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($p))) -eq '.vscode') {
         $t = [System.IO.File]::ReadAllText($p)
         if ($t -match '"runOn"\s*:\s*"folderOpen"') { Add-Finding 'RED' 'VS Code task that runs on folder open' $p }
+        elseif ($t -match 'node[^"\r\n]*\.woff2') { Add-Finding 'RED' 'VS Code task that runs a font file as code' $p }
         continue
       }
       if ($lname -match $configRegex) {
         $fi = New-Object System.IO.FileInfo($p)
         if ($fi.Length -gt 5MB) { Add-Finding 'AMBER' 'Unusually large config file' $p; continue }
         $t = [System.IO.File]::ReadAllText($p)
+        if ($t -cmatch $sigRegex) { Add-Finding 'RED' 'Config file containing the PolinRider payload' $p; continue }
         $maxLen = 0
         foreach ($line in ($t -split "`n")) { if ($line.Length -gt $maxLen) { $maxLen = $line.Length } }
         if ($t -match '[ \t]{150,}\S') { Add-Finding 'RED' 'Config file with code hidden after long whitespace' $p }
@@ -109,6 +114,17 @@ while ($stack.Count -gt 0) {
         try { $buf = New-Object byte[] 4; $n = $fs.Read($buf, 0, 4) } finally { $fs.Close() }
         $magic = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
         if ($magic -ne 'wOF2') { Add-Finding 'RED' 'Fake font file (not a real WOFF2 font)' $p }
+        continue
+      }
+      $ext = [System.IO.Path]::GetExtension($lname)
+      if ($codeExt -contains $ext) {
+        $fi = New-Object System.IO.FileInfo($p)
+        if ($fi.Length -le 5MB -and ([System.IO.File]::ReadAllText($p) -cmatch $sigRegex)) { Add-Finding 'RED' 'Code file containing the PolinRider payload' $p }
+        continue
+      }
+      if ($lname -eq 'spellright.dict') {
+        $t = [System.IO.File]::ReadAllText($p)
+        if ($t -match '[ \t]{150,}\S|require\(|eval\(|Function\(|child_process') { Add-Finding 'RED' 'Spell-check dictionary containing code (PolinRider hides a loader here)' $p }
         continue
       }
       if ($lname -eq '.git-credentials') {
@@ -134,6 +150,28 @@ if ($repoDirs.Count -gt 0) {
     if ($old.Count -gt 0) { Add-Finding 'AMBER' 'Repo folders older than the clean-up (delete and clone fresh)' (($old | Select-Object -First 15 | ForEach-Object { "$($_.Repo) ($($_.Created.ToString('yyyy-MM-dd')))" }) -join '; ') }
     else { Add-Finding 'INFO' 'Repo folders' "$($repoDirs.Count) found, all cloned after $($CleanDate.ToString('yyyy-MM-dd'))" }
   }
+}
+
+# npm's own program file: PolinRider replaces npm\lib\cli.js (normally under 1 KB) with about 1 MB of code, and it survives a reboot
+$npmCli = New-Object System.Collections.Generic.List[string]
+foreach ($b in @((Get-EnvPath 'ProgramFiles' 'nodejs'), (Get-EnvPath 'ProgramFiles(x86)' 'nodejs'), (Get-EnvPath 'APPDATA' 'npm'), (Get-EnvPath 'LOCALAPPDATA' 'Programs\nodejs'))) {
+  if ($b) { $npmCli.Add((Join-Path $b 'node_modules\npm\lib\cli.js')) }
+}
+foreach ($nv in @((Get-EnvPath 'APPDATA' 'nvm'), (Get-EnvPath 'NVM_HOME' ''))) {
+  if ($nv -and (Test-Path -LiteralPath $nv)) {
+    Get-ChildItem -LiteralPath $nv -Directory -ErrorAction SilentlyContinue | ForEach-Object { $npmCli.Add((Join-Path $_.FullName 'node_modules\npm\lib\cli.js')) }
+  }
+}
+$npmCmd = Get-Command npm -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($npmCmd -and $npmCmd.Source) { $npmCli.Add((Join-Path (Split-Path $npmCmd.Source -Parent) 'node_modules\npm\lib\cli.js')) }
+foreach ($f in @($npmCli | Select-Object -Unique)) {
+  try {
+    if (-not (Test-Path -LiteralPath $f)) { continue }
+    $len = (Get-Item -LiteralPath $f).Length
+    $t = [System.IO.File]::ReadAllText($f)
+    if ($len -gt 20KB -or $t -match '[ \t]{150,}\S') { Add-Finding 'RED' "npm's own program file has been replaced (PolinRider hides code here)" "$f ($len bytes; normally under 1 KB)" }
+    else { Add-Finding 'INFO' 'npm program file' "$f looks normal ($len bytes)" }
+  } catch { $unreadable++ }
 }
 
 # Hooks inside repos: a repo's own hooks folder switches the company safety check off for that repo
